@@ -1,0 +1,10 @@
+requirements.txt
+
+
+Flask
+flask-cors
+uvicorn
+neo4j
+mangum
+pydantic
+python-dotenv

@@ -1,0 +1,282 @@
+main.py
+
+
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from datetime import date
+import logging
+
+from api.neo4j_driver import Neo4jConnection
+from api.services import Neo4jService
+from api.config import NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD
+
+# App setup
+app = Flask(_name_)
+CORS(app)  # Allow all origins
+
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(_name_)
+
+# Neo4j connection
+conn = Neo4jConnection(NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD)
+neo4j_service = Neo4jService(conn)
+
+# Utility function to format success responses
+def success(message: str, data=None, status_code=200):
+    response = {
+        "status": "success",
+        "message": message,
+        "data": data if data is not None else []
+    }
+    return jsonify(response), status_code
+
+# Utility function to format error responses
+def error_response(message: str, status_code=400):
+    response = {
+        "status": "error",
+        "message": message,
+        "data": []  # Always include empty data array for consistent frontend handling
+    }
+    return jsonify(response), status_code
+
+# Routes
+@app.route("/", methods=["GET"])
+def read_root():
+    return success("API is running", {"version": "1.0.0"})
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    try:
+        result = conn.execute_query("RETURN 1 AS test")
+        if result and result[0]['test'] == 1:
+            return success("Health check passed", {"database": "connected"})
+        return error_response("Database connection test failed", 500)
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return error_response(f"Database connection error: {str(e)}", 500)
+
+@app.route("/create-user", methods=["POST"])
+def create_user():
+    try:
+        data = request.get_json()
+        if not data:
+            return error_response("Invalid JSON data", 400)
+            
+        userId = data.get('userId')
+        name = data.get('name')
+        email = data.get('email')
+
+        # Basic validation
+        if not userId:
+            return error_response("Missing required field: userId", 400)
+
+        neo4j_service.create_user(userId, name, email)
+        return success("User created or updated successfully", status_code=201)
+    except Exception as e:
+        logger.error(f"Error in create-user endpoint: {e}")
+        return error_response(f"Failed to create or update user: {str(e)}", 500)
+
+@app.route("/create-product", methods=["POST"])
+def create_product():
+    try:
+        data = request.get_json()
+        if not data:
+            return error_response("Invalid JSON data", 400)
+            
+        productId = data.get('productId')
+        name = data.get('name')
+        category = data.get('category')
+        price = data.get('price')
+
+        if not productId:
+            return error_response("Missing required field: productId", 400)
+
+        neo4j_service.create_product(productId, name, category, float(price) if price else 0)
+        return success("Product created successfully", status_code=201)
+    except Exception as e:
+        logger.error(f"Error in create-product endpoint: {e}")
+        return error_response(f"Failed to create product: {str(e)}", 500)
+
+@app.route("/update-product", methods=["POST"])
+def update_product():
+    try:
+        data = request.get_json()
+        if not data:
+            return error_response("Invalid JSON data", 400)
+            
+        productId = data.get('productId')
+        name = data.get('name')
+        category = data.get('category')
+        price = data.get('price')
+
+        if not productId:
+            return error_response("Missing required field: productId", 400)
+
+        price_float = float(price) if price is not None else None
+        neo4j_service.update_product(productId, name, category, price_float)
+        return success("Product updated successfully")
+    except Exception as e:
+        logger.error(f"Error in update-product endpoint: {e}")
+        return error_response(f"Failed to update product: {str(e)}", 500)
+
+@app.route("/delete-product", methods=["POST"])
+def delete_product():
+    try:
+        data = request.get_json()
+        if not data:
+            return error_response("Invalid JSON data", 400)
+            
+        productId = data.get('productId')
+
+        if not productId:
+            return error_response("Missing required field: productId", 400)
+
+        logger.info(f"Attempting to delete product with productId: {productId}")
+        neo4j_service.delete_product(productId)
+        return success("Product deleted successfully", status_code=200)
+    except Exception as e:
+        logger.error(f"Error in delete-product endpoint: {e}")
+        return error_response(f"Failed to delete product: {str(e)}", 500)
+
+@app.route("/purchase", methods=["POST"])
+def purchase():
+    try:
+        data = request.get_json()
+        if not data:
+            return error_response("Invalid JSON data", 400)
+            
+        userId = data.get('userId')
+        productId = data.get('productId')
+        quantity = data.get('quantity')
+        purchase_date = data.get('date')  # Expecting 'YYYY-MM-DD' string
+        product_data = data.get('product_data')  # Optional product data if product doesn't exist
+
+        if not userId or not productId:
+            return error_response("Missing required fields: userId or productId", 400)
+
+        quantity = int(quantity) if quantity else 1
+        date_str = purchase_date if purchase_date else date.today().isoformat()
+
+        # Use the improved create_purchase method
+        result = neo4j_service.create_purchase(
+            userId, 
+            productId, 
+            quantity, 
+            date_str,
+            product_data
+        )
+        
+        if "error" in result:
+            return error_response(f"Failed to record purchase: {result['error']}", 400)
+            
+        return success("Purchase recorded successfully", status_code=201)
+    except Exception as e:
+        logger.error(f"Error in purchase endpoint: {e}")
+        return error_response(f"Failed to record purchase: {str(e)}", 500)
+
+@app.route("/bulk-purchase", methods=["POST"])
+def bulk_purchase():
+    try:
+        data = request.get_json()
+        if not data:
+            return error_response("Invalid JSON data", 400)
+            
+        userId = data.get('userId')
+        purchases = data.get('purchases', [])
+
+        if not userId:
+            return error_response("Missing required field: userId", 400)
+            
+        if not purchases or not isinstance(purchases, list):
+            return error_response("Missing or invalid purchases data", 400)
+
+        result = neo4j_service.create_multiple_purchases(userId, purchases)
+        
+        if "error" in result:
+            return error_response(f"Failed to record purchases: {result['error']}", 400)
+            
+        if result.get("errors") and len(result["errors"]) > 0:
+            # Some purchases failed, but others may have succeeded
+            return jsonify({
+                "status": "partial_success",
+                "message": "Some purchases were recorded, but others failed",
+                "data": result["results"],
+                "errors": result["errors"]
+            }), 207  # 207 Multi-Status
+            
+        return success("All purchases recorded successfully", result["results"], status_code=201)
+    except Exception as e:
+        logger.error(f"Error in bulk-purchase endpoint: {e}")
+        return error_response(f"Failed to record purchases: {str(e)}", 500)
+
+@app.route("/recommendations", methods=["GET"])
+def recommendations():
+    try:
+        userId = request.args.get('userId')
+
+        if not userId:
+            return error_response("Missing required parameter: userId", 400)
+
+        recs = neo4j_service.get_recommendations(userId)
+        return success("Recommendations fetched successfully", recs)
+    except Exception as e:
+        logger.error(f"Error in recommendations endpoint: {e}")
+        return error_response(f"Failed to fetch recommendations: {str(e)}", 500)
+
+@app.route("/custom-recommendations", methods=["GET"])
+def custom_recommendations():
+    try:
+        userId = request.args.get('userId')
+
+        if not userId:
+            return error_response("Missing required parameter: userId", 400)
+
+        recs = neo4j_service.get_category_recommendations(userId)
+        return success("Category-based recommendations fetched successfully", recs)
+    except Exception as e:
+        logger.error(f"Error in custom-recommendations endpoint: {e}")
+        return error_response(f"Failed to fetch category-based recommendations: {str(e)}", 500)
+
+@app.route("/user-purchases", methods=["GET"])
+def user_purchases():
+    try:
+        userId = request.args.get('userId')
+
+        if not userId:
+            return error_response("Missing required parameter: userId", 400)
+
+        purchases = neo4j_service.get_user_purchases(userId)
+        return success("User purchases fetched successfully", purchases)
+    except Exception as e:
+        logger.error(f"Error in user-purchases endpoint: {e}")
+        return error_response(f"Failed to fetch user purchases: {str(e)}", 500)
+
+@app.route("/check-product", methods=["GET"])
+def check_product():
+    try:
+        productId = request.args.get('productId')
+
+        if not productId:
+            return error_response("Missing required parameter: productId", 400)
+
+        product = neo4j_service.get_product(productId)
+        if product:
+            return success("Product found", product)
+        else:
+            return error_response("Product not found", 404)
+    except Exception as e:
+        logger.error(f"Error checking product: {e}")
+        return error_response(f"Failed to check product: {str(e)}", 500)
+
+@app.teardown_appcontext
+def shutdown_event(exception=None):
+    try:
+        conn.close()
+        logger.info("Application shutdown: Neo4j connection closed.")
+    except Exception as e:
+        logger.error(f"Error closing Neo4j connection: {e}")
+
+if _name_ == "_main_":
+    app.run(debug=True)

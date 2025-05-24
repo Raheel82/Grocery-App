@@ -1,0 +1,401 @@
+services.py
+
+
+
+
+
+
+
+from api.neo4j_driver import Neo4jConnection
+from flask import abort
+from typing import Optional, List, Dict
+import logging
+
+logger = logging.getLogger(_name_)
+
+class Neo4jService:
+    def _init_(self, conn: Neo4jConnection):
+        self.conn = conn
+
+    def create_user(self, user_id: str, name: Optional[str] = None, email: Optional[str] = None):
+        try:
+            logger.info(f"Creating user with userId: {user_id}")
+            query = """
+            MERGE (u:User {userId: $user_id})
+            SET u.name = COALESCE($name, u.name),
+                u.email = COALESCE($email, u.email)
+            RETURN u
+            """
+            result = self.conn.execute_query(query, {"user_id": user_id, "name": name, "email": email})
+            logger.info(f"User created: {result}")
+            return result
+        except Exception as e:
+            logger.error(f"Error creating user: {e}")
+            abort(500, description="Failed to create user.")
+
+    def create_product(self, product_id: str, name: str, category: str, price: float):
+        try:
+            logger.info(f"Creating product with productId: {product_id}")
+            query = """
+            MERGE (p:Product {productId: $product_id})
+            SET p.name = $name, p.category = $category, p.price = $price
+            RETURN p
+            """
+            result = self.conn.execute_query(query, {
+                "product_id": product_id,
+                "name": name,
+                "category": category,
+                "price": price
+            })
+            logger.info(f"Product created: {result}")
+            return result
+        except Exception as e:
+            logger.error(f"Error creating product: {e}")
+            abort(500, description="Failed to create product.")
+            
+    def get_product(self, product_id: str):
+        """Get a product by ID, returns None if not found"""
+        try:
+            query = """
+            MATCH (p:Product {productId: $product_id})
+            RETURN p.productId AS productId, p.name AS name, 
+                   p.category AS category, p.price AS price
+            """
+            result = self.conn.execute_query(query, {"product_id": product_id})
+            return result[0] if result else None
+        except Exception as e:
+            logger.error(f"Error getting product: {e}")
+            return None
+            
+    def get_or_create_product(self, product_id: str, name: str = None, category: str = None, price: float = None):
+        """Get a product or create it if not found"""
+        product = self.get_product(product_id)
+        if product:
+            return product
+            
+        # Product not found, create it if we have all required fields
+        if name and category and price is not None:
+            logger.info(f"Product {product_id} not found, creating it with provided data")
+            self.create_product(product_id, name, category, price)
+            return self.get_product(product_id)
+        else:
+            logger.warning(f"Product {product_id} not found and insufficient data to create it")
+            return None
+
+    def create_purchase(self, user_id: str, product_id: str, quantity: int, date_str: str, product_data: Dict = None):
+        try:
+            # First verify the user exists
+            user_query = "MATCH (u:User {userId: $user_id}) RETURN u"
+            user_result = self.conn.execute_query(user_query, {"user_id": user_id})
+            
+            if not user_result:
+                logger.info(f"User {user_id} not found, creating it")
+                # Create the user if not found
+                self.create_user(user_id)
+                
+            # Check if product exists or create it with provided data
+            product = self.get_product(product_id)
+            
+            if not product:
+                logger.info(f"Product {product_id} not found, checking if we can create it")
+                
+                # If product_data was provided, create the product
+                if product_data and 'name' in product_data and 'category' in product_data and 'price' in product_data:
+                    logger.info(f"Creating missing product {product_id} from provided data")
+                    self.create_product(
+                        product_id, 
+                        product_data['name'], 
+                        product_data['category'], 
+                        float(product_data['price'])
+                    )
+                else:
+                    # No product data, we can't create the relationship
+                    logger.error(f"Cannot create purchase: Product {product_id} not found and no data provided")
+                    return {"error": f"Product not found: {product_id}"}
+            
+            # Create the purchase relationship
+            query = """
+            MATCH (u:User {userId: $user_id})
+            MATCH (p:Product {productId: $product_id})
+            MERGE (u)-[r:BOUGHT]->(p)
+            ON CREATE SET r.quantity = $quantity, r.date = $date
+            ON MATCH SET r.quantity = r.quantity + $quantity, r.date = $date
+            RETURN u, r, p
+            """
+            result = self.conn.execute_query(query, {
+                "user_id": user_id,
+                "product_id": product_id,
+                "quantity": quantity,
+                "date": date_str
+            })
+            return {"success": True, "result": result}
+        except Exception as e:
+            logger.error(f"Error creating purchase: {e}")
+            return {"error": str(e)}
+
+    def create_multiple_purchases(self, user_id: str, purchases: List[Dict]):
+        try:
+            results = []
+            errors = []
+            
+            # First create the user if not exists
+            user_query = "MATCH (u:User {userId: $user_id}) RETURN u"
+            user_result = self.conn.execute_query(user_query, {"user_id": user_id})
+            
+            if not user_result:
+                logger.info(f"User {user_id} not found for bulk purchase, creating it")
+                self.create_user(user_id)
+            
+            for purchase in purchases:
+                product_id = purchase.get("product_id")
+                quantity = purchase.get("quantity", 1)
+                date_str = purchase.get("date")
+                product_data = purchase.get("product_data")
+                
+                # Check if product exists
+                product = self.get_product(product_id)
+                
+                # If product doesn't exist, try to create it
+                if not product and product_data:
+                    if 'name' in product_data and 'category' in product_data and 'price' in product_data:
+                        logger.info(f"Creating missing product {product_id} for bulk purchase")
+                        try:
+                            self.create_product(
+                                product_id,
+                                product_data['name'],
+                                product_data['category'],
+                                float(product_data['price'])
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to create product {product_id}: {e}")
+                            errors.append({"product_id": product_id, "error": f"Failed to create product: {str(e)}"})
+                            continue
+                    else:
+                        logger.error(f"Incomplete product data for {product_id}")
+                        errors.append({"product_id": product_id, "error": "Incomplete product data"})
+                        continue
+                elif not product:
+                    logger.error(f"Product {product_id} not found and no data provided")
+                    errors.append({"product_id": product_id, "error": "Product not found and no data provided"})
+                    continue
+                
+                # Create purchase relationship
+                try:
+                    query = """
+                    MATCH (u:User {userId: $user_id})
+                    MATCH (p:Product {productId: $product_id})
+                    MERGE (u)-[r:BOUGHT]->(p)
+                    ON CREATE SET r.quantity = $quantity, r.date = $date
+                    ON MATCH SET r.quantity = r.quantity + $quantity, r.date = $date
+                    RETURN u, r, p
+                    """
+                    result = self.conn.execute_query(query, {
+                        "user_id": user_id,
+                        "product_id": product_id,
+                        "quantity": quantity,
+                        "date": date_str
+                    })
+                    results.append({"product_id": product_id, "result": "success"})
+                except Exception as e:
+                    logger.error(f"Error creating purchase for {product_id}: {e}")
+                    errors.append({"product_id": product_id, "error": str(e)})
+            
+            return {"success": len(errors) == 0, "results": results, "errors": errors}
+        except Exception as e:
+            logger.error(f"Error in multiple purchases: {e}")
+            return {"error": str(e)}
+
+    def get_user_purchases(self, user_id: str) -> List[Dict]:
+        try:
+            # First verify user exists
+            user_query = "MATCH (u:User {userId: $user_id}) RETURN u"
+            user_result = self.conn.execute_query(user_query, {"user_id": user_id})
+            
+            if not user_result:
+                logger.error(f"User not found: {user_id}")
+                return []
+                
+            query = """
+            MATCH (u:User {userId: $user_id})-[r:BOUGHT]->(p:Product)
+            RETURN p.productId AS productId, p.name AS name, p.category AS category, 
+                   p.price AS price, r.quantity AS quantity, r.date AS date
+            """
+            purchases = self.conn.execute_query(query, {"user_id": user_id})
+            return purchases
+        except Exception as e:
+            logger.error(f"Error fetching user purchases: {e}")
+            return []
+
+    def update_product(self, product_id: str, name: Optional[str] = None, category: Optional[str] = None, price: Optional[float] = None):
+        try:
+            query = """
+            MATCH (p:Product {productId: $product_id})
+            SET p.name = COALESCE($name, p.name),
+                p.category = COALESCE($category, p.category),
+                p.price = COALESCE($price, p.price)
+            RETURN p
+            """
+            result = self.conn.execute_query(query, {
+                "product_id": product_id,
+                "name": name,
+                "category": category,
+                "price": price
+            })
+            
+            if not result:
+                logger.error(f"Product not found for update: {product_id}")
+                abort(404, description=f"Product not found: {product_id}")
+                
+            return result
+        except Exception as e:
+            logger.error(f"Error updating product: {e}")
+            abort(500, description=f"Failed to update product: {str(e)}")
+            
+    def delete_product(self, product_id: str):
+        try:
+            logger.info(f"Attempting to delete product with productId: {product_id}")
+            query = """
+            MATCH (p:Product {productId: $product_id})
+            DETACH DELETE p
+            RETURN count(p) as deleted_count
+            """
+            result = self.conn.execute_query(query, {"product_id": product_id})
+            
+            if result and result[0]['deleted_count'] == 0:
+                logger.error(f"Product not found for deletion: {product_id}")
+                abort(404, description=f"Product not found: {product_id}")
+                
+            logger.info(f"Delete result: {result}")
+            return result
+        except Exception as e:
+            logger.error(f"Error deleting product: {e}")
+            abort(500, description=f"Failed to delete product: {str(e)}")
+
+    def get_recommendations(self, user_id: str):
+        try:
+            # First check if user exists
+            user_check_query = """
+            MATCH (u:User {userId: $user_id})
+            RETURN u
+            """
+            user_result = self.conn.execute_query(user_check_query, {"user_id": user_id})
+            
+            if not user_result:
+                logger.warning(f"User not found for recommendations: {user_id}")
+                return []  # Return empty list instead of aborting
+            
+            # Try collaborative filtering first
+            query = """
+            MATCH (u1:User {userId: $user_id})-[:BOUGHT]->(p:Product)<-[:BOUGHT]-(u2:User)
+            WHERE u1 <> u2
+            MATCH (u2)-[:BOUGHT]->(rec:Product)
+            WHERE NOT (u1)-[:BOUGHT]->(rec)
+            RETURN DISTINCT rec.productId AS productId, rec.name AS name, 
+                   rec.category AS category, rec.price AS price
+            LIMIT 10
+            """
+            recommendations = self.conn.execute_query(query, {"user_id": user_id})
+            logger.info(f"Collaborative recommendations count: {len(recommendations)}")
+
+            # If no collaborative recommendations, fall back to category recommendations
+            if not recommendations:
+                query_category = """
+                MATCH (u:User {userId: $user_id})-[:BOUGHT]->(p:Product)
+                WITH u, COLLECT(DISTINCT p.category) AS categories
+                MATCH (rec:Product)
+                WHERE rec.category IN categories AND NOT (u)-[:BOUGHT]->(rec)
+                RETURN DISTINCT rec.productId AS productId, rec.name AS name, 
+                       rec.category AS category, rec.price AS price
+                LIMIT 10
+                """
+                recommendations = self.conn.execute_query(query_category, {"user_id": user_id})
+                logger.info(f"Category recommendations count: {len(recommendations)}")
+
+            # If still no data, recommend popular products
+            if not recommendations:
+                logger.info("Falling back to popular products")
+                query_popular = """
+                MATCH (p:Product)<-[r:BOUGHT]-()
+                WITH p, count(r) AS purchases
+                RETURN p.productId AS productId, p.name AS name, 
+                       p.category AS category, p.price AS price, purchases
+                ORDER BY purchases DESC, p.price DESC
+                LIMIT 10
+                """
+                recommendations = self.conn.execute_query(query_popular)
+                
+                # If still nothing, just return some products
+                if not recommendations:
+                    query_any = """
+                    MATCH (p:Product)
+                    RETURN p.productId AS productId, p.name AS name, 
+                           p.category AS category, p.price AS price
+                    ORDER BY p.price DESC
+                    LIMIT 10
+                    """
+                    recommendations = self.conn.execute_query(query_any)
+
+            return recommendations
+        except Exception as e:
+            logger.error(f"Error fetching recommendations: {e}")
+            return []  # Return empty list instead of aborting
+
+    def get_category_recommendations(self, user_id: str):
+        try:
+            # First check if user exists
+            user_check_query = """
+            MATCH (u:User {userId: $user_id})
+            RETURN u
+            """
+            user_result = self.conn.execute_query(user_check_query, {"user_id": user_id})
+            
+            if not user_result:
+                logger.warning(f"User not found for category recommendations: {user_id}")
+                return []  # Return empty list instead of aborting
+                
+            # Check if user has any purchases
+            purchase_check_query = """
+            MATCH (u:User {userId: $user_id})-[:BOUGHT]->(p:Product)
+            RETURN p LIMIT 1
+            """
+            purchase_result = self.conn.execute_query(purchase_check_query, {"user_id": user_id})
+            
+            if not purchase_result:
+                logger.info(f"User has no purchases for category recommendations: {user_id}")
+                # Fall back to popular products by category
+                query_popular = """
+                MATCH (p:Product)
+                RETURN DISTINCT p.productId AS productId, p.name AS name, 
+                       p.category AS category, p.price AS price
+                ORDER BY p.category, p.price DESC
+                LIMIT 10
+                """
+                return self.conn.execute_query(query_popular)
+                
+            # Get category-based recommendations
+            query = """
+            MATCH (u:User {userId: $user_id})-[:BOUGHT]->(p:Product)
+            WITH u, COLLECT(DISTINCT p.category) AS categories
+            MATCH (rec:Product)
+            WHERE rec.category IN categories AND NOT (u)-[:BOUGHT]->(rec)
+            RETURN DISTINCT rec.productId AS productId, rec.name AS name, 
+                   rec.category AS category, rec.price AS price
+            LIMIT 10
+            """
+            recommendations = self.conn.execute_query(query, {"user_id": user_id})
+            
+            # If no results, fall back to any products
+            if not recommendations:
+                query_any = """
+                MATCH (p:Product)
+                RETURN p.productId AS productId, p.name AS name, 
+                       p.category AS category, p.price AS price
+                ORDER BY p.category, p.price DESC
+                LIMIT 10
+                """
+                recommendations = self.conn.execute_query(query_any)
+                
+            return recommendations
+        except Exception as e:
+            logger.error(f"Error fetching category-based recommendations: {e}")
+            return []  # Return empty list instead of aborting
